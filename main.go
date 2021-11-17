@@ -1,3 +1,6 @@
+// Доработать программу из практической части так, чтобы при отправке ей сигнала SIGUSR1 она увеличивала глубину поиска на 2.
+// Добавить общий таймаут на выполнение следующих операций: работа парсера, получений ссылок со страницы, формирование заголовка.
+
 package main
 
 import (
@@ -94,21 +97,24 @@ func (r requester) Get(ctx context.Context, url string) (Page, error) {
 type Crawler interface {
 	Scan(ctx context.Context, url string, depth int)
 	ChanResult() <-chan CrawlResult
+	IncDepth()
 }
 
 type crawler struct {
-	r       Requester
-	res     chan CrawlResult
-	visited map[string]struct{}
-	mu      sync.RWMutex
+	r        Requester
+	res      chan CrawlResult
+	visited  map[string]struct{}
+	mu       sync.RWMutex
+	maxDepth int
 }
 
-func NewCrawler(r Requester) *crawler {
+func NewCrawler(r Requester, depth int) *crawler {
 	return &crawler{
-		r:       r,
-		res:     make(chan CrawlResult),
-		visited: make(map[string]struct{}),
-		mu:      sync.RWMutex{},
+		r:        r,
+		res:      make(chan CrawlResult),
+		visited:  make(map[string]struct{}),
+		mu:       sync.RWMutex{},
+		maxDepth: depth,
 	}
 }
 
@@ -148,6 +154,12 @@ func (c *crawler) ChanResult() <-chan CrawlResult {
 	return c.res
 }
 
+func (c *crawler) IncDepth() {
+	c.mu.Lock()
+	c.maxDepth += 2
+	c.mu.Unlock()
+}
+
 //Config - структура для конфигурации
 type Config struct {
 	MaxDepth   int
@@ -170,9 +182,9 @@ func main() {
 	var r Requester
 
 	r = NewRequester(time.Duration(cfg.Timeout) * time.Second)
-	cr = NewCrawler(r)
+	cr = NewCrawler(r, cfg.MaxDepth)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Timeout)*time.Second)
 	go cr.Scan(ctx, cfg.Url, cfg.MaxDepth) //Запускаем краулер в отдельной рутине
 	go processResult(ctx, cancel, cr, cfg) //Обрабатываем результаты в отдельной рутине
 
@@ -182,9 +194,16 @@ func main() {
 		select {
 		case <-ctx.Done(): //Если всё завершили - выходим
 			return
-		case <-sigCh:
-			cancel() //Если пришёл сигнал SigInt - завершаем контекст
+		case sig := <-sigCh:
+			switch sig {
+			case syscall.SIGINT:
+				cancel() //Если пришёл сигнал SigInt - завершаем контекст
+			case syscall.SIGUSR1:
+				cr.IncDepth() //Если пришёл сигнал SIGUSR1 - увеличим глубину на 2
+
+			}
 		}
+
 	}
 }
 
