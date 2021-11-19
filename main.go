@@ -6,13 +6,15 @@ package main
 import (
 	"context"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
 	"github.com/PuerkitoBio/goquery"
 )
@@ -61,15 +63,20 @@ type Requester interface {
 
 type requester struct {
 	timeout time.Duration
+	logger  *zap.Logger
 }
 
-func NewRequester(timeout time.Duration) requester {
-	return requester{timeout: timeout}
+func NewRequester(timeout time.Duration, logger *zap.Logger) requester {
+	return requester{timeout: timeout, logger: logger}
 }
 
 func (r requester) Get(ctx context.Context, url string) (Page, error) {
+	r.logger.Debug("started", zap.String("url", url), zap.String("method", "requester"))
+	defer r.logger.Debug("finished", zap.String("url", url), zap.String("method", "requester"))
+
 	select {
 	case <-ctx.Done():
+		r.logger.Debug("ctx done", zap.String("url", url), zap.String("method", "requester"))
 		return nil, nil
 	default:
 		cl := &http.Client{
@@ -77,15 +84,18 @@ func (r requester) Get(ctx context.Context, url string) (Page, error) {
 		}
 		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
+			r.logger.Debug("Error by creating new request", zap.String("url", url), zap.String("err", err.Error()), zap.String("method", "requester"))
 			return nil, err
 		}
 		body, err := cl.Do(req)
 		if err != nil {
+			r.logger.Debug("Error by sending request", zap.String("url", url), zap.String("err", err.Error()), zap.String("method", "requester"))
 			return nil, err
 		}
 		defer body.Body.Close()
 		page, err := NewPage(body.Body)
 		if err != nil {
+			r.logger.Debug("Error by creating new page", zap.String("url", url), zap.String("err", err.Error()), zap.String("method", "requester"))
 			return nil, err
 		}
 		return page, nil
@@ -102,15 +112,17 @@ type Crawler interface {
 
 type crawler struct {
 	r        Requester
+	logger   zap.logger
 	res      chan CrawlResult
 	visited  map[string]struct{}
 	mu       sync.RWMutex
 	maxDepth int
 }
 
-func NewCrawler(r Requester, depth int) *crawler {
+func NewCrawler(r Requester, depth int, logger *zap.Logger) *crawler {
 	return &crawler{
 		r:        r,
+		logger:   *zap.Logger,
 		res:      make(chan CrawlResult),
 		visited:  make(map[string]struct{}),
 		mu:       sync.RWMutex{},
@@ -119,6 +131,9 @@ func NewCrawler(r Requester, depth int) *crawler {
 }
 
 func (c *crawler) Scan(ctx context.Context, url string, depth int) {
+	c.logger.Debug("started", zap.String("url", url), zap.Int("depth", depth), zap.String("method", "crawler"))
+	defer c.logger.Debug("finished", zap.String("url", url), zap.Int("depth", depth), zap.String("method", "crawler"))
+
 	if depth <= 0 { //Проверяем то, что есть запас по глубине
 		return
 	}
@@ -130,10 +145,12 @@ func (c *crawler) Scan(ctx context.Context, url string, depth int) {
 	}
 	select {
 	case <-ctx.Done(): //Если контекст завершен - прекращаем выполнение
+		c.logger.Debug("ctx was done", zap.String("url", url), zap.String("method", "crawler"))
 		return
 	default:
 		page, err := c.r.Get(ctx, url) //Запрашиваем страницу через Requester
 		if err != nil {
+			c.logger.Error("Error with getting page", zap.String("url", url), zap.String("method", "crawler"), zap.String("err", err.Error()))
 			c.res <- CrawlResult{Err: err} //Записываем ошибку в канал
 			return
 		}
@@ -167,26 +184,47 @@ type Config struct {
 	MaxErrors  int
 	Url        string
 	Timeout    int //in seconds
+	LogLevel   int
 }
 
 func main() {
-
 	cfg := Config{
 		MaxDepth:   3,
 		MaxResults: 10,
 		MaxErrors:  5,
 		Url:        "https://telegram.org",
 		Timeout:    10,
+		LogLevel:   zapcore.InfoLevel,
 	}
 	var cr Crawler
 	var r Requester
 
-	r = NewRequester(time.Duration(cfg.Timeout) * time.Second)
-	cr = NewCrawler(r, cfg.MaxDepth)
+	logCfg := zap.Config{
+		Level:       zap.NewAtomicLevelAt(zapcore.Level(cfg.LogLevel)),
+		Development: false,
+		Sampling: &zap.SamplingConfig{
+			Initial:    100,
+			Thereafter: 100,
+		},
+		Encoding:         "console",
+		EncoderConfig:    zap.NewDevelopmentEncoderConfig(),
+		OutputPaths:      []string{"stdout"},
+		ErrorOutputPaths: []string{"stderr"},
+	}
+
+	log, _ := logCfg.Build()
+	defer log.Sync() // flushes buffer, if any
+
+	pidLog := log.With(zap.Int("pid", os.Getpid()))
+
+	pidLog.Debug("start")
+
+	r = NewRequester(time.Duration(cfg.Timeout)*time.Second, pidLog)
+	cr = NewCrawler(r, cfg.MaxDepth, pidLog)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Timeout)*time.Second)
-	go cr.Scan(ctx, cfg.Url, cfg.MaxDepth) //Запускаем краулер в отдельной рутине
-	go processResult(ctx, cancel, cr, cfg) //Обрабатываем результаты в отдельной рутине
+	go cr.Scan(ctx, cfg.Url, cfg.MaxDepth)         //Запускаем краулер в отдельной рутине
+	go processResult(ctx, cancel, cr, cfg, pidLog) //Обрабатываем результаты в отдельной рутине
 
 	sigCh := make(chan os.Signal)        //Создаем канал для приема сигналов
 	signal.Notify(sigCh, syscall.SIGINT) //Подписываемся на сигнал SIGINT
@@ -197,8 +235,10 @@ func main() {
 		case sig := <-sigCh:
 			switch sig {
 			case syscall.SIGINT:
+				pidLog.Debug("Got SIGINT")
 				cancel() //Если пришёл сигнал SigInt - завершаем контекст
 			case syscall.SIGUSR1:
+				pidLog.Debug("Got SIGUSR1")
 				cr.IncDepth() //Если пришёл сигнал SIGUSR1 - увеличим глубину на 2
 
 			}
@@ -207,7 +247,7 @@ func main() {
 	}
 }
 
-func processResult(ctx context.Context, cancel func(), cr Crawler, cfg Config) {
+func processResult(ctx context.Context, cancel func(), cr Crawler, cfg Config, log *zap.Logger) {
 	var maxResult, maxErrors = cfg.MaxResults, cfg.MaxErrors
 	for {
 		select {
@@ -216,14 +256,14 @@ func processResult(ctx context.Context, cancel func(), cr Crawler, cfg Config) {
 		case msg := <-cr.ChanResult():
 			if msg.Err != nil {
 				maxErrors--
-				log.Printf("crawler result return err: %s\n", msg.Err.Error())
+				log.Error("crawler error", zap.Int("maxErrors", maxErrors), zap.String("err", msg.Err.Error()))
 				if maxErrors <= 0 {
 					cancel()
 					return
 				}
 			} else {
 				maxResult--
-				log.Printf("crawler result: [url: %s] Title: %s\n", msg.Url, msg.Title)
+				log.Info("crawler result", zap.Int("maxResult", maxErrors), zap.String("url", msg.Url), zap.String("title", msg.Title))
 				if maxResult <= 0 {
 					cancel()
 					return
